@@ -88,23 +88,25 @@ altitude = [0]
 position = [[0, 0, 0]]
 velocity = [[0, 0, 0]]
 acceleration = [[0, 0, 0]]
+orientation = [[0, 0, 0]]
 
 # ---------- Setup ----------
-port = 'COM4' # for windows computers
-# port = '/dev/ttyUSB4' 
+# port = 'COM4' # for windows computers
+port = '/dev/ttyUSB0' # for linux machines /dev/ttyUSB4' 
 baudrate = 9600
 ser = serial.Serial(port, baudrate, timeout=1)
 time.sleep(2)
 
-init_line = ser.readline().decode('utf-8').strip() # accx, accy, accz
-init_acc = list(map(float, init_line.split()))
+START_PHRASE = "BEGIN_TRANSMISSION"
+print(f"Waiting for '{START_PHRASE}' to start...\n")
 
-mag = h.sqrt(sum(acc**2 for acc in init_acc))
-pitch = h.atan2(init_acc[2], mag)
-roll = 0
-yaw = h.atan2(init_acc[1], init_acc[0])
-
-orientation = [[roll, pitch, yaw]]
+while True:
+    try:
+        line = ser.readline().decode('utf-8').strip()
+        if line == START_PHRASE:
+            break
+    except Exception as e:
+        print(f"Serial read error while waiting: {e}")
 
 last_time = time.time()
 
@@ -112,41 +114,68 @@ last_time = time.time()
 print("Reading and filtering data... Press Ctrl+C to stop.\n")
 
 try:
+    last_line = ""
+
     while True:
-        # Get raw 
         current_time = time.time()
-        delta_t = current_time-last_time
+        delta_t = current_time - last_time
+
         line = ser.readline().decode('utf-8').strip()
-        raw_data = list(map(float, line.split()))
 
-        # Kalman Filter
-        for i in range(len(raw_data)):
-            filtered_data[i] = filtered_data[i].update(raw_data[i])
+        # Ignore if same as previous
+        if line == last_line:
+            continue
 
-        # Update direct measurements
-        gyroscope.append(filtered_data[5:])
-        altitude = get_altitude(altitude, filtered_data[0], filtered_data[1])
-        orientation = get_orientation(orientation, gyroscope[-2:], delta_t)
-        acceleration = orient_acceleration(acceleration, filtered_data[2:5], orientation[-1])
+        # Try to parse floats
+        parts = line.split()
+        if len(parts) != 8:
+            print(f"Skipping invalid line: {line}")
+            continue
 
-        # Calculate inderect measurements
-        acc_tmp_velocity = integrate_velocity(velocity[-1], acceleration, delta_t)
-        acc_tmp_position = integrate_position(position[-1], [velocity[-1], acc_tmp_velocity], delta_t)
+        try:
+            raw_data = list(map(float, parts))
 
-        bmp_tmp_velocity = differentiate_velocity(altitude, delta_t)
+            # Kalman Filter
+            for i in range(len(raw_data)):
+                filtered_data[i] = filtered_data[i].update(raw_data[i])
 
-        # Scale inderect measurements
-        position_scale_weight = acc_tmp_position[-1][2]/h.sqrt(sum(acc_tmp_position[i] - position[-1][i] for i in range(3)))
-        velocity_scale_weight = acc_tmp_velocity[-1][2]/h.sqrt(sum(acc_tmp_velocity[i] - velocity[-1][i] for i in range(3)))
+            # Update direct measurements
+            gyroscope.append(filtered_data[5:])
+            altitude = get_altitude(altitude, filtered_data[0], filtered_data[1])
+            orientation = get_orientation(orientation, gyroscope[-2:], delta_t)
+            acceleration = orient_acceleration(acceleration, filtered_data[2:5], orientation[-1])
 
-        position_scalar = (altitude[-1]-altitude[-2]) * position_scale_weight + (acc_tmp_position[2] - position[-1][2]) * (1-position_scale_weight)
-        velocity_scalar = (bmp_tmp_velocity-velocity[-1][2]) * velocity_scale_weight + (acc_tmp_velocity[2] - velocity[-1][2]) * (1-velocity_scale_weight)
+            # Calculate indirect measurements
+            acc_tmp_velocity = integrate_velocity(velocity[-1], acceleration, delta_t)
+            acc_tmp_position = integrate_position(position[-1], [velocity[-1], acc_tmp_velocity], delta_t)
 
-        velocity.append([vel*velocity_scalar for vel in acc_tmp_velocity])
-        position.append([pos*position_scalar for pos in acc_tmp_position])
+            bmp_tmp_velocity = differentiate_velocity(altitude, delta_t)
 
-        # Update time incroment
-        last_time = current_time
+            # Scale indirect measurements
+            pos_mag = h.sqrt(sum(acc_tmp_position[i] - position[-1][i] for i in range(3)))
+            vel_mag = h.sqrt(sum(acc_tmp_velocity[i] - velocity[-1][i] for i in range(3)))
+
+            if pos_mag > 10:
+                position_scale_weight = acc_tmp_position[-1][2] / pos_mag
+                position_scalar = (altitude[-1] - altitude[-2]) * position_scale_weight + (acc_tmp_position[2] - position[-1][2]) * (1 - position_scale_weight)
+                position.append([pos * position_scalar for pos in acc_tmp_position])
+            else:
+                position.append(acc_tmp_position)
+
+            if vel_mag > 10:
+                velocity_scale_weight = acc_tmp_velocity[-1][2] / vel_mag
+                velocity_scalar = (bmp_tmp_velocity - velocity[-1][2]) * velocity_scale_weight + (acc_tmp_velocity[2] - velocity[-1][2]) * (1 - velocity_scale_weight)
+                velocity.append([vel * velocity_scalar for vel in acc_tmp_velocity])
+            else:
+                velocity.append(acc_tmp_velocity)
+
+            last_time = current_time
+
+            print(position[-1])
+            
+        except ValueError:
+            print(f"Skipping non-numeric line: {line}")
+            continue
 
 except KeyboardInterrupt:
     print("\nStopped reading.")
